@@ -107,7 +107,7 @@ Each question must have exactly {opts} answer options.
 Exactly one option must be the correct answer; the rest must be plausible but clearly wrong to someone who understood the material.
 Vary which option position (0, 1, 2, ...) holds the correct answer -- do not always put it first.
 
-Return ONLY a valid JSON array, with no text before or after it. Each element must have exactly this shape:
+Return ONLY a JSON array -- your entire response must start with [ and end with ]. Do not wrap it in an object, do not add markdown code fences, do not add any text before or after it. Each element must have exactly this shape:
 {{
   "question": "the question text",
   "options": ["option A text", "option B text", "..."],
@@ -142,23 +142,58 @@ def call_ollama(model: str, prompt: str, host: str) -> str:
 
 
 def extract_json_array(raw: str):
-    """Best-effort extraction of a JSON array from a model response,
-    even if the model added stray text around it."""
+    """Best-effort extraction of a JSON array from a model response, even
+    if the model added stray text around it, wrapped it in a code fence,
+    or nested it inside an object like {"questions": [...]} instead of
+    returning a bare array (all common with small local models)."""
     raw = raw.strip()
+    # strip a markdown code fence if present
+    fence = re.match(r"^```(?:json)?\s*(.*?)\s*```$", raw, re.DOTALL)
+    if fence:
+        raw = fence.group(1).strip()
+
+    def _unwrap(value):
+        if isinstance(value, list):
+            return value
+        if isinstance(value, dict):
+            for key in ("questions", "quiz", "items", "data", "results"):
+                if isinstance(value.get(key), list):
+                    return value[key]
+            # a dict of one question rather than a list of questions
+            if "question" in value:
+                return [value]
+        return None
+
     try:
-        return json.loads(raw)
+        return _unwrap(json.loads(raw))
     except json.JSONDecodeError:
         pass
+
+    # try to locate the outermost array anywhere in the text
     match = re.search(r"\[.*\]", raw, re.DOTALL)
     if match:
         try:
-            return json.loads(match.group(0))
+            return _unwrap(json.loads(match.group(0)))
         except json.JSONDecodeError:
-            return None
+            pass
+
+    # fall back to locating an outermost object
+    match = re.search(r"\{.*\}", raw, re.DOTALL)
+    if match:
+        try:
+            return _unwrap(json.loads(match.group(0)))
+        except json.JSONDecodeError:
+            pass
+
     return None
 
 
 def validate_questions(items, num_options: int):
+    """Coerce and accept near-miss output from small models rather than
+    rejecting outright: a slightly wrong option count or a stringified
+    index are still usable -- the exported quiz app renders each
+    question's own option list independently, so exact uniformity
+    across questions isn't actually required."""
     valid = []
     for item in items or []:
         if not isinstance(item, dict):
@@ -166,18 +201,33 @@ def validate_questions(items, num_options: int):
         q = item.get("question")
         opts = item.get("options")
         idx = item.get("correct_index")
+
         if not isinstance(q, str) or not q.strip():
             continue
-        if not isinstance(opts, list) or len(opts) != num_options:
+        if not isinstance(opts, list) or len(opts) < 2:
             continue
-        if not all(isinstance(o, str) and o.strip() for o in opts):
+
+        opts = [str(o).strip() for o in opts if str(o).strip()]
+        if len(opts) < 2:
             continue
-        if not isinstance(idx, int) or not (0 <= idx < num_options):
+
+        # coerce a stringified index ("0", "2") to int
+        if isinstance(idx, str) and idx.strip().isdigit():
+            idx = int(idx.strip())
+        # some models label the correct option by its text instead of an index
+        if isinstance(idx, str) and idx not in opts:
+            match = next((k for k, o in enumerate(opts) if o.lower() == idx.strip().lower()), None)
+            idx = match if match is not None else None
+        elif isinstance(idx, str) and idx in opts:
+            idx = opts.index(idx)
+
+        if not isinstance(idx, int) or not (0 <= idx < len(opts)):
             continue
+
         valid.append(
             {
                 "question": q.strip(),
-                "options": [o.strip() for o in opts],
+                "options": opts,
                 "correct_index": idx,
                 "explanation": str(item.get("explanation", "")).strip(),
             }
@@ -219,7 +269,11 @@ def generate_quiz(text: str, model: str, host: str, total_questions: int, num_op
         parsed = extract_json_array(raw)
         valid = validate_questions(parsed, num_options)
         if not valid:
-            log.append(f"Section {i + 1}: model did not return usable questions, skipped.")
+            preview = raw.strip().replace("\n", " ")[:300]
+            log.append(
+                f"Section {i + 1}: model did not return usable questions, skipped. "
+                f"Raw response preview: `{preview}{'...' if len(raw.strip()) > 300 else ''}`"
+            )
         else:
             all_questions.extend(valid)
             log.append(f"Section {i + 1}: generated {len(valid)} valid question(s).")
