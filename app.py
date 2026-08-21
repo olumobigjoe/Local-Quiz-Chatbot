@@ -1,26 +1,34 @@
 """
-Course Material -> Quiz Generator (local LLM via Ollama)
-==========================================================
+Course Material -> Quiz Generator (Ollama Cloud)
+====================================================
 Run with:  streamlit run app.py
 
 Upload a PDF or DOCX of course material. This tool reads the text,
-sends it to a locally-running Ollama model to draft multiple-choice
+sends it to a model hosted on Ollama Cloud to draft multiple-choice
 questions (with plausible wrong options AND a suggested correct
 answer), lets you review/edit everything, then exports a completely
 separate, self-contained `quiz_app.py` + `README.md` you can hand to
 students or push to GitHub. The exported quiz app needs only
-`streamlit` to run -- it does NOT need Ollama, since the questions and
-answers are baked in as data.
+`streamlit` to run -- it does NOT call Ollama at all, since the
+questions and answers are baked in as data.
 
-Requires Ollama running locally (https://ollama.com) with at least one
-model pulled, e.g.:
-    ollama pull llama3.2:1b
-    ollama pull qwen3:4b
+Requires an Ollama Cloud API key (free tier available):
+    1. Sign up / sign in at https://ollama.com
+    2. Create an API key: https://ollama.com/settings/keys
+    3. Either set it as an environment variable before launching --
+         export OLLAMA_API_KEY=your_key_here      (Mac/Linux)
+         setx OLLAMA_API_KEY "your_key_here"       (Windows, new terminal after)
+       -- or paste it into the sidebar field when the app is running.
+
+No local model download, no `ollama serve`, and your laptop doesn't
+need to stay on for a deployed version of this app to keep working --
+inference runs on Ollama's cloud infrastructure.
 """
 
 import base64
 import io
 import json
+import os
 import re
 import zipfile
 from datetime import datetime
@@ -31,11 +39,16 @@ import streamlit as st
 # ============================================================================
 # CONFIG
 # ============================================================================
-DEFAULT_OLLAMA_HOST = "http://localhost:11434"
-MODEL_OPTIONS = ["llama3.2:1b", "qwen3:4b"]
-CHUNK_CHARS = 3000  # ~ safe chunk size for small local models
+OLLAMA_CLOUD_HOST = "https://ollama.com"
+# A few reasonable defaults for structured-JSON generation tasks like this
+# one. Ollama's cloud catalog changes over time -- if you want a different
+# model, use "Custom model tag..." in the sidebar and check what's
+# currently available to your account at https://ollama.com/settings/keys
+# or by calling GET https://ollama.com/api/tags with your API key.
+MODEL_OPTIONS = ["gpt-oss:20b", "gpt-oss:120b", "qwen3.5", "deepseek-v3.1:671b", "Custom model tag..."]
+CHUNK_CHARS = 4000  # cloud models handle larger context comfortably
 
-st.set_page_config(page_title="Quiz Generator (Local LLM)", page_icon="📚", layout="wide")
+st.set_page_config(page_title="Quiz Generator (Ollama Cloud)", page_icon="📚", layout="wide")
 
 # ============================================================================
 # SESSION STATE
@@ -124,9 +137,11 @@ COURSE MATERIAL:
 """
 
 
-def call_ollama(model: str, prompt: str, host: str) -> str:
+def call_ollama(model: str, prompt: str, host: str, api_key: str) -> str:
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
     resp = requests.post(
         f"{host}/api/chat",
+        headers=headers,
         json={
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
@@ -136,6 +151,16 @@ def call_ollama(model: str, prompt: str, host: str) -> str:
         },
         timeout=600,
     )
+    if resp.status_code == 401:
+        raise PermissionError(
+            "Ollama Cloud rejected the API key (401 Unauthorized). "
+            "Check the key in the sidebar / OLLAMA_API_KEY env var."
+        )
+    if resp.status_code == 429:
+        raise RuntimeError(
+            "Ollama Cloud rate/usage limit hit (429). Wait a bit, reduce the "
+            "number of questions, or upgrade your plan at https://ollama.com/pricing."
+        )
     resp.raise_for_status()
     data = resp.json()
     return data.get("message", {}).get("content", "")
@@ -190,10 +215,12 @@ def extract_json_array(raw: str):
 
 def validate_questions(items, num_options: int):
     """Coerce and accept near-miss output from small models rather than
-    rejecting outright: a slightly wrong option count or a stringified
-    index are still usable -- the exported quiz app renders each
-    question's own option list independently, so exact uniformity
-    across questions isn't actually required."""
+    rejecting outright, but enforce the requested option count exactly
+    so the final quiz is uniform (mixed 3/4/5-option questions read as
+    broken to a student). If the model gave too many options, the extra
+    WRONG ones are trimmed (the correct one is always kept). If it gave
+    too few, the question is dropped -- there's no safe way to invent a
+    plausible extra distractor without another model call."""
     valid = []
     for item in items or []:
         if not isinstance(item, dict):
@@ -224,6 +251,16 @@ def validate_questions(items, num_options: int):
         if not isinstance(idx, int) or not (0 <= idx < len(opts)):
             continue
 
+        # enforce exact option count for a uniform quiz
+        if len(opts) > num_options:
+            correct_text = opts[idx]
+            wrong_opts = [o for k, o in enumerate(opts) if k != idx]
+            keep_wrong = wrong_opts[: num_options - 1]
+            opts = keep_wrong + [correct_text]
+            idx = len(opts) - 1
+        elif len(opts) < num_options:
+            continue  # can't safely fabricate a missing distractor
+
         valid.append(
             {
                 "question": q.strip(),
@@ -235,12 +272,59 @@ def validate_questions(items, num_options: int):
     return valid
 
 
-def generate_quiz(text: str, model: str, host: str, total_questions: int, num_options: int):
+def _generate_from_chunk(chunk: str, n: int, model: str, host: str, api_key: str, num_options: int, log: list, label: str):
+    """Ask the model for n questions from one chunk, validate, log the
+    outcome, and return the list of valid questions (possibly empty).
+    Raises PermissionError on a bad API key so the caller can stop the
+    whole run immediately instead of retrying a doomed request repeatedly."""
+    prompt = PROMPT_TEMPLATE.format(n=n, opts=num_options, material=chunk)
+    try:
+        raw = call_ollama(model, prompt, host, api_key)
+    except PermissionError:
+        raise  # let the caller abort the whole run, not just this chunk
+    except requests.exceptions.ConnectionError:
+        log.append(f"{label}: could not reach {host}. Check your internet connection.")
+        return []
+    except RuntimeError as e:  # rate limit
+        log.append(f"{label}: {e}")
+        return []
+    except Exception as e:  # noqa: BLE001
+        log.append(f"{label}: request failed ({e}).")
+        return []
+
+    parsed = extract_json_array(raw)
+    valid = validate_questions(parsed, num_options)
+    if not valid:
+        preview = raw.strip().replace("\n", " ")[:300]
+        log.append(
+            f"{label}: model did not return usable questions, skipped. "
+            f"Raw response preview: `{preview}{'...' if len(raw.strip()) > 300 else ''}`"
+        )
+    else:
+        log.append(f"{label}: generated {len(valid)} valid question(s).")
+    return valid
+
+
+MAX_PER_CALL = 4  # small local models are much more reliable generating a
+                   # short JSON array than a long one in a single response;
+                   # split bigger requests into several smaller calls instead.
+
+
+def _split_into_batches(n: int, batch_size: int = MAX_PER_CALL):
+    batches = []
+    remaining = n
+    while remaining > 0:
+        take = min(batch_size, remaining)
+        batches.append(take)
+        remaining -= take
+    return batches
+
+
+def generate_quiz(text: str, model: str, host: str, api_key: str, total_questions: int, num_options: int):
     chunks = chunk_text(text)
     if not chunks:
         return [], ["No text could be extracted from the document."]
 
-    # distribute questions across chunks proportionally
     n_chunks = len(chunks)
     base = total_questions // n_chunks
     remainder = total_questions % n_chunks
@@ -249,36 +333,64 @@ def generate_quiz(text: str, model: str, host: str, total_questions: int, num_op
     all_questions = []
     log = []
     progress = st.progress(0.0, text="Starting generation...")
-    for i, (chunk, n) in enumerate(zip(chunks, per_chunk)):
-        progress.progress((i) / n_chunks, text=f"Generating from section {i + 1}/{n_chunks}...")
-        if n <= 0:
-            continue
-        prompt = PROMPT_TEMPLATE.format(n=n, opts=num_options, material=chunk)
-        try:
-            raw = call_ollama(model, prompt, host)
-        except requests.exceptions.ConnectionError:
-            log.append(
-                f"Section {i + 1}: could not connect to Ollama at {host}. "
-                "Is `ollama serve` running?"
-            )
-            continue
-        except Exception as e:  # noqa: BLE001
-            log.append(f"Section {i + 1}: request failed ({e}).")
-            continue
 
-        parsed = extract_json_array(raw)
-        valid = validate_questions(parsed, num_options)
-        if not valid:
-            preview = raw.strip().replace("\n", " ")[:300]
-            log.append(
-                f"Section {i + 1}: model did not return usable questions, skipped. "
-                f"Raw response preview: `{preview}{'...' if len(raw.strip()) > 300 else ''}`"
+    try:
+        for i, (chunk, n) in enumerate(zip(chunks, per_chunk)):
+            progress.progress(i / n_chunks, text=f"Generating from section {i + 1}/{n_chunks}...")
+            if n <= 0:
+                continue
+            batches = _split_into_batches(n)
+            for b, batch_n in enumerate(batches):
+                label = f"Section {i + 1}" + (f" (batch {b + 1}/{len(batches)})" if len(batches) > 1 else "")
+                all_questions.extend(
+                    _generate_from_chunk(chunk, batch_n, model, host, api_key, num_options, log, label)
+                )
+
+        # ---- top-up pass: strict validation means some questions get
+        # dropped (wrong option count, no answer key found, etc.), so the
+        # first pass often falls short of the target. Keep asking for the
+        # remainder, cycling through chunks, up to a small retry cap so a
+        # stubborn document can't loop forever.
+        max_extra_rounds = 8
+        round_num = 0
+        while len(all_questions) < total_questions and round_num < max_extra_rounds:
+            round_num += 1
+            deficit = total_questions - len(all_questions)
+            progress.progress(
+                0.9, text=f"Topping up {deficit} more question(s) (round {round_num})..."
             )
-        else:
-            all_questions.extend(valid)
-            log.append(f"Section {i + 1}: generated {len(valid)} valid question(s).")
+            chunk = chunks[round_num % n_chunks]
+            batch_n = min(deficit, MAX_PER_CALL)
+            got = _generate_from_chunk(
+                chunk,
+                batch_n,
+                model,
+                host,
+                api_key,
+                num_options,
+                log,
+                f"Top-up round {round_num}",
+            )
+            # avoid near-duplicate questions if the model regenerates similar
+            # content from the same chunk on repeated top-up rounds
+            existing = {q["question"].strip().lower() for q in all_questions}
+            got = [q for q in got if q["question"].strip().lower() not in existing]
+            all_questions.extend(got)
+            if not got:
+                # this chunk isn't yielding more -- no point retrying it again
+                continue
+    except PermissionError as e:
+        progress.progress(1.0, text="Stopped.")
+        log.append(str(e))
+        return all_questions[:total_questions], log
 
     progress.progress(1.0, text="Done.")
+    if len(all_questions) < total_questions:
+        log.append(
+            f"Reached the retry limit with {len(all_questions)}/{total_questions} questions. "
+            "The model may be struggling with this document/option count -- try fewer "
+            "questions, a larger/better model (e.g. qwen3:4b), or fewer options per question."
+        )
     return all_questions[:total_questions], log
 
 
@@ -445,21 +557,40 @@ with st.chat_message("assistant"):
 # ---- Sidebar settings ----
 with st.sidebar:
     st.header("Settings")
-    model = st.selectbox(
-        "Local model",
+    model_choice = st.selectbox(
+        "Model (Ollama Cloud)",
         MODEL_OPTIONS,
         index=0,
-        help="llama3.2:1b is faster and lighter (recommended default on 8GB RAM). "
-        "qwen3:4b tends to write better questions but is slower on CPU.",
+        help="gpt-oss:20b is a good low-usage-tier default on the free plan. "
+        "gpt-oss:120b / qwen3.5 / deepseek-v3.1 are larger and higher quality "
+        "but consume your plan's usage allowance faster.",
     )
-    ollama_host = st.text_input("Ollama host", value=DEFAULT_OLLAMA_HOST)
+    if model_choice == "Custom model tag...":
+        model = st.text_input(
+            "Model tag",
+            placeholder="e.g. glm-4.6:cloud",
+            help="Check currently available tags for your account at "
+            "https://ollama.com/settings/keys or via GET https://ollama.com/api/tags",
+        )
+    else:
+        model = model_choice
+
+    api_key = st.text_input(
+        "Ollama API key",
+        value=os.environ.get("OLLAMA_API_KEY", ""),
+        type="password",
+        help="From https://ollama.com/settings/keys. Pre-filled automatically "
+        "if the OLLAMA_API_KEY environment variable is set before launching.",
+    )
     num_questions = st.slider("Number of questions", 3, 30, 10)
     num_options = st.slider("Options per question", 2, 6, 4)
     st.divider()
     st.caption(
-        "Make sure Ollama is running (`ollama serve`) and the model is "
-        f"pulled (`ollama pull {model}`)."
+        "Runs on Ollama Cloud, not your machine -- no local model download, "
+        "and this works the same whether you run the app locally or deploy it "
+        "(e.g. to Streamlit Community Cloud)."
     )
+    st.caption("Get a free API key: https://ollama.com")
 
 # ---- File upload ----
 uploaded = st.file_uploader("Upload course material", type=["pdf", "docx"])
@@ -482,18 +613,27 @@ if st.session_state.raw_text:
         st.write(
             f"I read **{word_count:,} words** from `{st.session_state.source_filename}`. "
             f"Ready to draft **{num_questions} questions** ({num_options} options each) "
-            f"using **{model}**."
+            f"using **{model}** on Ollama Cloud."
         )
     if word_count < 30:
         st.warning(
             "That's very little extracted text -- if this is a scanned/image-only "
             "PDF, text extraction won't work. Try a text-based PDF or DOCX."
         )
+    if not api_key:
+        st.warning(
+            "No Ollama API key set -- add one in the sidebar (or set the "
+            "OLLAMA_API_KEY environment variable) before generating."
+        )
+    if not model:
+        st.warning("Enter a custom model tag in the sidebar, or pick one from the list.")
 
-    if st.button("🚀 Generate Quiz", type="primary", disabled=word_count < 30):
-        with st.spinner("Talking to the local model... this can take a while on CPU."):
+    if st.button(
+        "🚀 Generate Quiz", type="primary", disabled=word_count < 30 or not api_key or not model
+    ):
+        with st.spinner("Talking to Ollama Cloud..."):
             questions, log = generate_quiz(
-                st.session_state.raw_text, model, ollama_host, num_questions, num_options
+                st.session_state.raw_text, model, OLLAMA_CLOUD_HOST, api_key, num_questions, num_options
             )
         st.session_state.questions = questions
         st.session_state.generation_log = log
@@ -548,7 +688,7 @@ if st.session_state.questions:
             st.session_state.questions, st.session_state.source_filename, model
         )
 
-        col1, col2, col3 = st.columns(3)
+        col1, col2, col3, col4 = st.columns(4)
         with col1:
             st.download_button(
                 "⬇️ Download quiz_app.py",
@@ -566,12 +706,22 @@ if st.session_state.questions:
                 use_container_width=True,
             )
         with col3:
+            questions_json = json.dumps(st.session_state.questions, ensure_ascii=False, indent=2)
+            st.download_button(
+                "⬇️ Download questions.json",
+                data=questions_json,
+                file_name="questions.json",
+                mime="application/json",
+                use_container_width=True,
+            )
+        with col4:
             zip_buf = io.BytesIO()
             with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
                 zf.writestr("quiz_app.py", quiz_code)
                 zf.writestr("README.md", readme)
+                zf.writestr("questions.json", questions_json)
             st.download_button(
-                "⬇️ Download both (.zip)",
+                "⬇️ Download all (.zip)",
                 data=zip_buf.getvalue(),
                 file_name="generated_quiz.zip",
                 mime="application/zip",
